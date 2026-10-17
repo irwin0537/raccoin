@@ -491,6 +491,24 @@ mod descriptor_tests {
         .to_string()
     }
 
+    fn transaction_fixtures(
+        ids: std::ops::RangeInclusive<u32>,
+        script: &ScriptBuf,
+        confirmed: bool,
+    ) -> Vec<serde_json::Value> {
+        let template: serde_json::Value =
+            serde_json::from_str(&confirmed_transaction(std::slice::from_ref(script))).unwrap();
+        ids.map(|id| {
+            let mut tx = template[0].clone();
+            tx["txid"] = serde_json::json!(format!("{id:064x}"));
+            if !confirmed {
+                tx["status"] = serde_json::json!({"confirmed": false});
+            }
+            tx
+        })
+        .collect()
+    }
+
     #[tokio::test]
     async fn fixed_descriptor_and_duplicate_source_are_looked_up_once() {
         let server = MockEsplora::new(|_| (200, "[]".to_owned()));
@@ -624,5 +642,79 @@ mod descriptor_tests {
             .await
             .is_err());
         assert_eq!(server.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn pagination_imports_all_confirmed_pages_after_mempool_transactions() {
+        let input = format!("wpkh({XPUB}/0/0)");
+        let script = BitcoinDescriptor::parse_list(&input).unwrap()[0]
+            .address(0)
+            .unwrap()
+            .script_pubkey();
+        let mut first = transaction_fixtures(100..=149, &script, false);
+        first.extend(transaction_fixtures(1..=25, &script, true));
+        let pages = [
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&transaction_fixtures(26..=50, &script, true)).unwrap(),
+            serde_json::to_string(&transaction_fixtures(51..=51, &script, true)).unwrap(),
+        ];
+        let server = MockEsplora::new(move |index| {
+            pages
+                .get(index)
+                .map_or((400, "Unexpected page".to_owned()), |body| {
+                    (200, body.clone())
+                })
+        });
+        let transactions = descriptor_addresses_transactions(&server.client(), &input)
+            .await
+            .unwrap();
+        assert_eq!(transactions.len(), 51);
+        let hashes: HashSet<_> = transactions.iter().map(|tx| tx.tx_hash.clone()).collect();
+        assert_eq!(hashes.len(), 51);
+        assert!(hashes.contains(&Some(format!("{:064x}", 51))));
+        assert!(!hashes.contains(&Some(format!("{:064x}", 100))));
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains("/txs HTTP/1.1"));
+        assert!(requests[1].contains(&format!("/txs/chain/{:064x} HTTP/1.1", 25)));
+        assert!(requests[2].contains(&format!("/txs/chain/{:064x} HTTP/1.1", 50)));
+    }
+
+    #[tokio::test]
+    async fn pagination_stops_at_an_empty_page_after_exactly_twenty_five_transactions() {
+        let input = format!("wpkh({XPUB}/0/0)");
+        let script = BitcoinDescriptor::parse_list(&input).unwrap()[0]
+            .address(0)
+            .unwrap()
+            .script_pubkey();
+        let first = serde_json::to_string(&transaction_fixtures(1..=25, &script, true)).unwrap();
+        let server = MockEsplora::new(move |index| match index {
+            0 => (200, first.clone()),
+            1 => (200, "[]".to_owned()),
+            _ => (400, "Unexpected page".to_owned()),
+        });
+        let transactions = descriptor_addresses_transactions(&server.client(), &input)
+            .await
+            .unwrap();
+        assert_eq!(transactions.len(), 25);
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn pagination_failure_returns_an_error_instead_of_partial_history() {
+        let input = format!("wpkh({XPUB}/0/0)");
+        let script = BitcoinDescriptor::parse_list(&input).unwrap()[0]
+            .address(0)
+            .unwrap()
+            .script_pubkey();
+        let first = serde_json::to_string(&transaction_fixtures(1..=25, &script, true)).unwrap();
+        let server = MockEsplora::new(move |index| match index {
+            0 => (200, first.clone()),
+            _ => (400, "Unavailable".to_owned()),
+        });
+        assert!(descriptor_addresses_transactions(&server.client(), &input)
+            .await
+            .is_err());
+        assert_eq!(server.request_count(), 2);
     }
 }

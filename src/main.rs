@@ -2076,8 +2076,9 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        // todo: show error in UI
-                        println!("Error syncing transactions: {}", e);
+                        let message = format!("Error syncing transactions: {e:#}");
+                        println!("{message}");
+                        app_for_future.borrow().report_error(&message);
                     }
                 }
             }).unwrap();
